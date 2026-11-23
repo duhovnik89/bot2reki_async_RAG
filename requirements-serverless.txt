@@ -1,0 +1,4 @@
+aiogram>=3.10,<4.0
+vkbottle>=4.3
+aiohttp>=3.9
+openai>=1.0

@@ -1,0 +1,48 @@
+%% architecture v4 — 2026-11-15
+%% Изменения: схема переведена на Yandex Cloud Serverless (как работает в проде);
+%% добавлено хранилище истории переписки (отдельный бакет) и база из бакета;
+%% модель deepseek-flash без режима рассуждений.
+flowchart TD
+
+    TG_USER["Житель в Telegram"]
+    VK_USER["Житель во ВКонтакте"]
+
+    GW["API Gateway\n/ (Telegram webhook) · /vk-callback"]
+
+    subgraph FN_SG ["Cloud Function — serverless_handler.handler"]
+        SYNC_PATH["Быстрая ветка (секунды)\n/start · старт → приветствие, кнопки, очистка истории\n«Ищу ответ…» → задание в async-вызов"]
+        WORKER["Async-воркер (само-вызов, HMAC-подпись)\nprocess_tg_job · process_vk_job"]
+        ENGINE["RulesEngine (bot/search.py)\nsystem = правила + весь архив решений\n+ история разговора + вопрос"]
+        HIST["bot/history.py\nпоследние 10 сообщений за 60 мин\nпо 1000 символов"]
+        DBSRC["bot/db_source.py\nrules.db → /tmp, проверка раз в 5 мин"]
+    end
+
+    subgraph S3_SG ["Object Storage"]
+        RULES_BUCKET[("Бакет базы решений\nrules.db\nфункции — только чтение")]
+        HIST_BUCKET[("Бакет истории\nhistory/tg|vk/чат/житель.json\nавтоудаление через 7 дней")]
+    end
+
+    DS["DeepSeek API\nmodel: deepseek-flash · thinking: disabled\ntemperature 0.1 · max_tokens 1024\nархив решений — кэшируемый префикс"]
+
+    SYNC_BOX["bot/sync.py (локально)\nrules.xlsx → rules.db\nзагрузка в бакет вручную"]
+
+    OK["Ответ жителю"]
+    NOADM["«Информации не нашлось.\nОбратитесь к администратору: @duhovnik_89»"]
+
+    TG_USER --> GW
+    VK_USER --> GW
+    GW --> SYNC_PATH
+    SYNC_PATH -->|"?integration=async"| WORKER
+    SYNC_PATH -->|"/start: удалить историю"| HIST
+
+    WORKER -->|"1. прочитать историю"| HIST
+    WORKER -->|"2. вопрос + история"| ENGINE
+    ENGINE --> DS
+    DS -->|"ответ"| OK
+    DS -->|"[НУЖЕН_АДМИНИСТРАТОР]"| NOADM
+    WORKER -->|"3. дописать вопрос и ответ\n(только удачные)"| HIST
+
+    HIST <-->|"GET / PUT / DELETE\nотказ → ответ без истории + ERROR в логе"| HIST_BUCKET
+    DBSRC -->|"GET с If-None-Match"| RULES_BUCKET
+    DBSRC --> ENGINE
+    SYNC_BOX --> RULES_BUCKET
