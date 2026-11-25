@@ -26,7 +26,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Создаётся один раз на холодном старте и переживает тёплые вызовы —
-# большой системный промпт с архивом строится только один раз.
+# RulesEngine (индекс фрагментов, эмбеддер, LLM) собирается только один раз.
 from aiogram import Bot, Dispatcher, types
 from aiogram.client.session.aiohttp import AiohttpSession
 

@@ -130,7 +130,7 @@ async def cb_doc_guide(callback: CallbackQuery) -> None:
 async def handle_text(message: Message) -> None:
     """Быстрая часть: подтвердить приём и отдать вопрос в async-воркер.
 
-    Поход в DeepSeek занимает 13-60 секунд и в окно ожидания Telegram не
+    Поход в LLM может занимать десятки секунд и в окно ожидания Telegram не
     укладывается. Здесь остаётся только отправка "Ищу ответ..." — функция
     успевает вернуть шлюзу 200 за доли секунды, и Telegram не уходит в ретраи.
     """
@@ -184,7 +184,7 @@ async def process_tg_job(job: dict, bot: Bot) -> None:
         # Задание, поставленное до выкатки истории, ключа conv не несёт.
         conv = job.get("conv") or conversation_key("tg", chat_id, chat_id)
         history = await _history.aload(conv)
-        logger.info("Воркер: иду в DeepSeek для чата %s (история: %d)", chat_id, len(history))
+        logger.info("Воркер: иду в LLM для чата %s (история: %d)", chat_id, len(history))
         answer, ok = await _engine.ask(job["text"], history)
         logger.info("Воркер: ответ получен (%s символов), отправляю", len(answer))
         await _send_long(bot, chat_id, answer)

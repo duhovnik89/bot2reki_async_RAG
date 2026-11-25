@@ -4,3 +4,9 @@ aiohttp>=3.9
 python-dotenv>=1.0
 openpyxl>=3.1
 openai>=1.0
+# RAG: ядро LlamaIndex + эмбеддинги и генерация через OpenAI-совместимый API
+# (OpenRouter). Локальных моделей и PyTorch больше нет.
+llama-index-core>=0.14
+llama-index-embeddings-openai-like>=0.5
+llama-index-llms-openrouter>=0.4
+numpy>=1.26

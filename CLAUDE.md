@@ -2,54 +2,45 @@
 
 ## О проекте
 Бот для жителей поселения Междуречье — работает в Telegram и ВКонтакте.
-Отвечает на вопросы о решениях общего собрания по Excel-файлу с помощью DeepSeek AI.
+Отвечает на вопросы о решениях общего собрания с помощью RAG-поиска (LlamaIndex) и LLM через OpenRouter.
 
 ## Стек
 - Python + aiogram 3.x (Telegram)
 - Python + vkbottle 4.x (ВКонтакте, daemon thread)
-- DeepSeek API через openai-клиент (весь архив решений — в system prompt)
-- SQLite (хранение решений через bot/sync.py)
-- openpyxl (чтение Excel → SQLite через bot/sync.py)
+- RAG: llama-index-core + VectorStoreIndex в памяти
+- Эмбеддинги через OpenRouter API (OpenAI-совместимый /v1/embeddings, класс OpenAILikeEmbedding + подкласс с префиксами e5 «query: »/«passage: »); модель intfloat/multilingual-e5-large
+- Генерация: LLM google/gemini-3.1-flash-lite через класс llama-index OpenRouter (llama-index-llms-openrouter), ответы идут через llm.achat()
+- Дисковый кэш векторов data/rules.embeddings.npz (ключ — md5 текста фрагмента; смена модели/сервера сбрасывает кэш)
+- В промпт LLM идут только топ-K найденных фрагментов
+- openpyxl (чтение Excel → rules.json через bot/sync.py)
 - python-dotenv (секреты)
+- Локальных нейросетевых библиотек (PyTorch и т.п.) нет
 
 ## Архитектура
 Один процесс, два бота запускаются параллельно. Telegram — через asyncio.gather, VK — в daemon thread со своим event loop (vkbottle несовместим с внешним event loop).
 
-```
-bot-mezhdureche/
-├── main.py                  # точка входа: asyncio.gather(telegram, vk)
-├── requirements.txt
-├── .env.example
-├── config/
-│   └── settings.py          # load_dotenv() + все константы
-├── bot/
-│   ├── handlers.py          # Telegram-хендлеры (Router), /start /help /about
-│   ├── vk_bot.py            # VK-хендлеры (BotLabeler) + run_vk_bot()
-│   ├── search.py            # RulesEngine: грузит весь архив в память + DeepSeek API
-│   ├── history.py           # история переписки жителя (бакет HISTORY_S3_BUCKET)
-│   ├── db_source.py         # rules.db из бакета DB_S3_BUCKET
-│   ├── yc_iam.py            # IAM-токен функции для Object Storage
-│   └── sync.py              # openpyxl → SQLite FTS5 (запускать отдельно при обновлении Excel)
-└── data/
-    ├── rules.xlsx           # файл правил (не в git)
-    └── rules.db             # SQLite база (не в git, генерируется sync.py)
-```
+Поток данных: `rules.xlsx` → sync.py → `rules.json` (записи «лист — дата — текст») → RulesEngine при старте режет записи на фрагменты, берёт их векторы из дискового кэша (новые — через OpenRouter API) и строит VectorStoreIndex в памяти → на каждый вопрос векторный поиск топ-12 фрагментов → только они + вопрос уходят в LLM.
 
-## Поток данных
-Excel → sync.py → rules.db (SQLite) → RulesEngine загружает весь архив при старте → DeepSeek API получает полный архив в system prompt → ответ жителю.
-На serverless rules.db берётся из бакета Object Storage (bot/db_source.py, переменная DB_S3_BUCKET), с проверкой обновлений раз в 5 минут; rules.db из пакета — запасная. Внесение протоколов — скилл `протокол-в-базу`.
-Если ответа нет → маркер [НУЖЕН_АДМИНИСТРАТОР] → текст с контактом @duhovnik_89.
+Уточняющие вопросы: перед векторным поиском вопрос дополняется последними репликами жителя (`_search_query`); история переписки по-прежнему лежит в бакете HISTORY_S3_BUCKET и идёт модели между системным промптом и вопросом.
 
-История переписки (bot/history.py): отдельный бакет HISTORY_S3_BUCKET, объект на разговор `history/<tg|vk>/<чат>/<житель>.json`. Модели — последние 10 сообщений за час, по 1000 символов, между системным промптом и вопросом (база решений остаётся кэшируемым префиксом). Хранение 7 дней (правило жизненного цикла бакета + чистка в коде). /start и «старт» в ВК стирают историю. Хранилище недоступно → ответ без истории + ERROR в логе. Неудачные ответы (ошибка DeepSeek) в историю не пишутся.
+Дубли (хронология дублирует тематические листы) выбрасываются после поиска; LongContextReorder расставляет лучшие фрагменты по краям контекста.
 
-Модель: DEEPSEEK_MODEL (по умолчанию deepseek-flash) с `thinking: disabled` — у flash рассуждения включены по умолчанию.
+Эмбеддер и индекс общие для всех RulesEngine процесса (кэш `_index_cache` по версии файла): TG- и VK-движки не дублируют друг друга. Отказ эмбеддинг-API при сборке индекса не роняет бот и не «запоминается» — сборка повторится на следующем вопросе.
 
-Тесты: `.venv/Scripts/python -m pytest -q tests` (DeepSeek и облако подменены).
+Файл правил: без бакета — `data/rules.json`; с бакетом — RULES_S3_BUCKET (source.py, ETag-проверка раз в RULES_REFRESH_SECONDS, файл качается в /tmp). Пересобрать rules.json: `python -m bot.sync`.
+
+Модель: LLM_MODEL (по умолчанию google/gemini-3.1-flash-lite), temperature 0.1, max_tokens 1024.
+
+Serverless: с API-эмбеддерами пакет снова лёгкий (без PyTorch) — деплой в Yandex Cloud Functions возможен; нюанс — кэш векторов живёт в /tmp только в рамках тёплого инстанса, холодный старт делает запросы к OpenRouter (при полном кэше это доля секунды... нет: на холодном инстансе /tmp пуст, поэтому первая сборка = запросы к API). См. docs/DEPLOY_YANDEX_SERVERLESS.md.
+
+Тесты: `.venv/Scripts/python -m pytest -q tests` (LLM, эмбеддинги и облако подменены, сети нет).
 
 ## Правила для Claude
 - Не трогай .env (там секреты)
 - Секреты храни в .env, читай через python-dotenv
-- Логику поиска держи в bot/search.py (класс RulesEngine)
+- Логику RAG держи в bot/search.py (класс RulesEngine)
 - Telegram-хендлеры — в bot/handlers.py (не telegram_bot.py)
 - VK-хендлеры — в bot/vk_bot.py
 - VK-бот запускается через threading.Thread + bot.run_forever() — не через asyncio.gather напрямую
+- В тестах RulesEngine передавай embed_model (MockEmbedding из test_dialog.py) и cache_path во временный каталог — чтобы не звать API и не трогать общий кэш
+- BaseEmbedding — pydantic-модель: свои атрибуты только через PrivateAttr

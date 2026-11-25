@@ -2,3 +2,9 @@ aiogram>=3.10,<4.0
 vkbottle>=4.3
 aiohttp>=3.9
 openai>=1.0
+# LLM и эмбеддинги через API (OpenRouter) — тяжёлых локальных моделей нет,
+# пакет в лимиты Cloud Functions помещается.
+llama-index-core>=0.14
+llama-index-embeddings-openai-like>=0.5
+llama-index-llms-openrouter>=0.4
+numpy>=1.26

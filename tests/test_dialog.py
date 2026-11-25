@@ -1,10 +1,15 @@
-"""Сквозная цепочка: вопрос → история → DeepSeek → ответ, в Telegram и ВК.
+"""Сквозная цепочка: вопрос → история → RAG-поиск → LLM → ответ, в TG и ВК.
 
-DeepSeek подменён: тест видит, какие сообщения уходят модели.
+LLM подменён: тест видит, какие сообщения уходят модели. Эмбеддинги тоже
+подменены (детерминированный «мешок слов») — без сети и без API-ключей.
 """
 import asyncio
-import sqlite3
+import json
+import zlib
+from pathlib import Path
 from types import SimpleNamespace
+
+from llama_index.core.embeddings import BaseEmbedding
 
 import pytest
 
@@ -13,43 +18,68 @@ from bot.history import HistoryStore, MemoryBackend, conversation_key
 from bot.search import RulesEngine
 
 
-def make_db(path, rows):
-    con = sqlite3.connect(path)
-    con.execute("CREATE TABLE rules_raw (id INTEGER, sheet TEXT, row_order INTEGER, content TEXT)")
-    con.executemany(
-        "INSERT INTO rules_raw VALUES (?, ?, ?, ?)",
-        [(i, "Все решения (хронология)", i, text) for i, text in enumerate(rows)],
+def make_rules(path, rows):
+    """rules.json в формате bot/sync.py: записи хронологии с датами."""
+    records = [
+        {"sheet": "Все решения (хронология)", "order": i, "date": "01.01.2026", "text": text}
+        for i, text in enumerate(rows)
+    ]
+    Path(path).write_text(
+        json.dumps({"records": records}, ensure_ascii=False), encoding="utf-8"
     )
-    con.commit()
-    con.close()
     return str(path)
 
 
-class FakeDeepSeek:
+class MockEmbedding(BaseEmbedding):
+    """Слово → crc32 → позиция в векторе: пересечения слов дают близость."""
+
+    def __init__(self):
+        super().__init__(model_name="mock")
+
+    def _embed(self, text):
+        vector = [0.0] * 64
+        for word in text.lower().split():
+            vector[zlib.crc32(word.encode()) % 64] = 1.0
+        return vector
+
+    def _get_query_embedding(self, query):
+        return self._embed(query)
+
+    async def _aget_query_embedding(self, query):
+        return self._embed(query)
+
+    def _get_text_embedding(self, text):
+        return self._embed(text)
+
+
+class FakeLLM:
     def __init__(self, replies=None, fail=False):
         self.calls = []
         self.replies = list(replies or [])
         self.fail = fail
-        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self.create))
 
-    async def create(self, **kwargs):
-        self.calls.append(kwargs)
+    async def achat(self, messages):
+        self.calls.append(list(messages))
         if self.fail:
-            raise ConnectionError("deepseek down")
+            raise ConnectionError("llm down")
         text = self.replies.pop(0) if self.replies else "ответ"
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=text))])
+        return SimpleNamespace(message=SimpleNamespace(content=text))
 
 
 @pytest.fixture
 def engine(tmp_path):
-    eng = RulesEngine(db_path=make_db(tmp_path / "rules.db", ["06.06.2026: кур держать можно, до 15 голов"]))
-    eng._client = FakeDeepSeek()
+    eng = RulesEngine(
+        rules_path=make_rules(tmp_path / "rules.json", ["кур держать можно, до 15 голов"]),
+        embed_model=MockEmbedding(),
+        cache_path=str(tmp_path / "cache.npz"),
+    )
+    eng._llm = FakeLLM()
     return eng
 
 
 def dialog(call):
     """Сообщения без системного промпта: что модель видит из разговора."""
-    return [(m["role"], m["content"]) for m in call["messages"][1:]]
+    return [(m.role, m.content) for m in call[1:]]
 
 
 def run(coro):
@@ -65,20 +95,19 @@ def test_history_goes_between_rules_and_question(engine):
         {"role": "assistant", "content": "Да, до 15 голов."},
     ]
     text, ok = run(engine.ask("А если их десять?", history))
-    call = engine._client.calls[0]
-    assert call["messages"][0]["role"] == "system"
-    assert "кур держать можно" in call["messages"][0]["content"]
+    call = engine._llm.calls[0]
+    assert call[0].role == "system"
+    assert "кур держать можно" in call[0].content
     assert dialog(call) == [
         ("user", "Можно держать кур?"),
         ("assistant", "Да, до 15 голов."),
         ("user", "А если их десять?"),
     ]
-    assert call["extra_body"] == {"thinking": {"type": "disabled"}}
     assert ok is True
 
 
 def test_escalation_still_works(engine):
-    engine._client.replies = ["[НУЖЕН_АДМИНИСТРАТОР]"]
+    engine._llm.replies = ["[НУЖЕН_АДМИНИСТРАТОР]"]
     text, ok = run(engine.ask("Сколько стоит электричество?"))
     assert "Обратитесь к администратору" in text
     assert "[НУЖЕН" not in text
@@ -86,21 +115,21 @@ def test_escalation_still_works(engine):
 
 
 def test_api_error_is_not_ok(engine):
-    engine._client = FakeDeepSeek(fail=True)
+    engine._llm = FakeLLM(fail=True)
     text, ok = run(engine.ask("вопрос"))
     assert "Ошибка при обращении к AI" in text
     assert ok is False
 
 
-def test_history_survives_rules_db_update(engine, tmp_path):
+def test_history_survives_rules_json_update(engine, tmp_path):
     store = HistoryStore(MemoryBackend())
     conv = conversation_key("tg", 1, 1)
     store.append(conv, "Можно держать кур?", "Да, до 15 голов.")
-    # Базу решений пересобрали из xlsx и подменили
-    engine._build(make_db(tmp_path / "rules_v2.db", ["07.11.2026: кур держать можно, до 20 голов"]))
+    # rules.json пересобрали из xlsx и подменили
+    engine._build(make_rules(tmp_path / "rules_v2.json", ["кур держать можно, до 20 голов"]), "v2")
     run(engine.ask("А если их десять?", store.load(conv)))
-    call = engine._client.calls[0]
-    assert "до 20 голов" in call["messages"][0]["content"]
+    call = engine._llm.calls[0]
+    assert "до 20 голов" in call[0].content
     assert ("user", "Можно держать кур?") in dialog(call)
 
 
@@ -137,7 +166,7 @@ def vk_message(peer_id, from_id, text):
 def test_vk_follow_up_is_about_chickens(vk):
     run(vk_callback.handle_vk_event(vk_message(10, 10, "Можно держать кур?")))
     run(vk_callback.handle_vk_event(vk_message(10, 10, "А если их десять?")))
-    second = vk.engine._client.calls[1]
+    second = vk.engine._llm.calls[1]
     assert dialog(second)[0] == ("user", "Можно держать кур?")
     assert dialog(second)[-1] == ("user", "А если их десять?")
 
@@ -145,7 +174,7 @@ def test_vk_follow_up_is_about_chickens(vk):
 def test_vk_two_residents_isolated(vk):
     run(vk_callback.handle_vk_event(vk_message(10, 10, "Можно держать кур?")))
     run(vk_callback.handle_vk_event(vk_message(20, 20, "А если их десять?")))
-    assert dialog(vk.engine._client.calls[1]) == [("user", "А если их десять?")]
+    assert dialog(vk.engine._llm.calls[1]) == [("user", "А если их десять?")]
 
 
 def test_vk_start_clears_history(vk):
@@ -154,11 +183,11 @@ def test_vk_start_clears_history(vk):
     assert "чистого листа" in vk.sent[-1][1]
     assert "Привет, Анна" in vk.sent[-1][1]
     run(vk_callback.handle_vk_event(vk_message(10, 10, "А если их десять?")))
-    assert dialog(vk.engine._client.calls[-1]) == [("user", "А если их десять?")]
+    assert dialog(vk.engine._llm.calls[-1]) == [("user", "А если их десять?")]
 
 
 def test_vk_failed_answer_not_remembered(vk):
-    vk.engine._client.fail = True
+    vk.engine._llm.fail = True
     run(vk_callback.handle_vk_event(vk_message(10, 10, "Можно держать кур?")))
     assert vk.store.load(conversation_key("vk", 10, 10)) == []
 
@@ -208,14 +237,14 @@ def tg_job(chat_id, user_id, text):
 def test_tg_follow_up_is_about_chickens(tg):
     run(handlers.process_tg_job(tg_job(1, 1, "Можно держать кур?"), tg.bot))
     run(handlers.process_tg_job(tg_job(1, 1, "А если их десять?"), tg.bot))
-    assert dialog(tg.engine._client.calls[1])[0] == ("user", "Можно держать кур?")
+    assert dialog(tg.engine._llm.calls[1])[0] == ("user", "Можно держать кур?")
     assert tg.bot.sent[-1] == (1, "ответ")
 
 
 def test_tg_two_residents_isolated(tg):
     run(handlers.process_tg_job(tg_job(1, 1, "Можно держать кур?"), tg.bot))
     run(handlers.process_tg_job(tg_job(2, 2, "А если их десять?"), tg.bot))
-    assert dialog(tg.engine._client.calls[1]) == [("user", "А если их десять?")]
+    assert dialog(tg.engine._llm.calls[1]) == [("user", "А если их десять?")]
 
 
 def test_tg_job_without_conv_still_answers(tg):

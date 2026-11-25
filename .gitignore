@@ -25,6 +25,8 @@ data/.~lock.*
 
 # Базы и выгрузки (генерируются, содержат личные данные)
 data/*.db
+data/rules.json
+data/rules.embeddings.npz
 data/backup/
 data/выгрузки/
 

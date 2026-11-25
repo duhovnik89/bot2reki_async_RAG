@@ -1,7 +1,8 @@
-%% architecture v4 — 2026-11-15
-%% Изменения: схема переведена на Yandex Cloud Serverless (как работает в проде);
-%% добавлено хранилище истории переписки (отдельный бакет) и база из бакета;
-%% модель deepseek-flash без режима рассуждений.
+%% architecture v6 — 2026-11-24
+%% Изменения: эмбеддинги переведены с локальной HuggingFace-модели (PyTorch)
+%% на OpenRouter API (/v1/embeddings, OpenAI-совместимый); добавлен дисковый
+%% кэш векторов rules.embeddings.npz — повторные старты собирают индекс без
+%% вызовов API. Пакет снова лёгкий, деплой в Cloud Functions возможен.
 flowchart TD
 
     TG_USER["Житель в Telegram"]
@@ -9,22 +10,26 @@ flowchart TD
 
     GW["API Gateway\n/ (Telegram webhook) · /vk-callback"]
 
-    subgraph FN_SG ["Cloud Function — serverless_handler.handler"]
+    subgraph FN_SG ["Процесс бота (main.py) · serverless-обёртка"]
         SYNC_PATH["Быстрая ветка (секунды)\n/start · старт → приветствие, кнопки, очистка истории\n«Ищу ответ…» → задание в async-вызов"]
         WORKER["Async-воркер (само-вызов, HMAC-подпись)\nprocess_tg_job · process_vk_job"]
-        ENGINE["RulesEngine (bot/search.py)\nsystem = правила + весь архив решений\n+ история разговора + вопрос"]
+        INDEX["VectorStoreIndex в памяти (LlamaIndex)\n290 фрагментов; векторы — из дискового кэша"]
+        EMB["OpenRouter API\n/v1/embeddings · multilingual-e5-large\nэмбеддятся только недостающие фрагменты"]
+        ENGINE["RulesEngine (bot/search.py)\nвопрос + последние реплики → векторный поиск\ntop-12 фрагментов → правила + фрагменты + вопрос"]
         HIST["bot/history.py\nпоследние 10 сообщений за 60 мин\nпо 1000 символов"]
-        DBSRC["bot/db_source.py\nrules.db → /tmp, проверка раз в 5 мин"]
+        DBSRC["bot/source.py\nrules.json → /tmp, ETag-проверка раз в 5 мин"]
     end
 
     subgraph S3_SG ["Object Storage"]
-        RULES_BUCKET[("Бакет базы решений\nrules.db\nфункции — только чтение")]
+        RULES_BUCKET[("Бакет архива решений\nrules.json\nзалил файл — бот подхватил")]
         HIST_BUCKET[("Бакет истории\nhistory/tg|vk/чат/житель.json\nавтоудаление через 7 дней")]
     end
 
-    DS["DeepSeek API\nmodel: deepseek-flash · thinking: disabled\ntemperature 0.1 · max_tokens 1024\nархив решений — кэшируемый префикс"]
+    DS["OpenRouter API\nLLM: google/gemini-3.1-flash-lite\ntemperature 0.1 · max_tokens 1024\nво входе — только найденные фрагменты"]
 
-    SYNC_BOX["bot/sync.py (локально)\nrules.xlsx → rules.db\nзагрузка в бакет вручную"]
+    SYNC_BOX["bot/sync.py (локально)\nrules.xlsx → rules.json\nзагрузка в бакет вручную"]
+
+    CACHE[("data/rules.embeddings.npz\nвекторы по хэшу текста фрагмента\nсмена модели — кэш сбрасывается")]
 
     OK["Ответ жителю"]
     NOADM["«Информации не нашлось.\nОбратитесь к администратору: @duhovnik_89»"]
@@ -37,6 +42,9 @@ flowchart TD
 
     WORKER -->|"1. прочитать историю"| HIST
     WORKER -->|"2. вопрос + история"| ENGINE
+    ENGINE -->|"поиск"| INDEX
+    INDEX <-->|"векторы знакомых фрагментов"| CACHE
+    INDEX -.->|"новые/изменённые фрагменты"| EMB
     ENGINE --> DS
     DS -->|"ответ"| OK
     DS -->|"[НУЖЕН_АДМИНИСТРАТОР]"| NOADM
@@ -44,5 +52,5 @@ flowchart TD
 
     HIST <-->|"GET / PUT / DELETE\nотказ → ответ без истории + ERROR в логе"| HIST_BUCKET
     DBSRC -->|"GET с If-None-Match"| RULES_BUCKET
-    DBSRC --> ENGINE
+    DBSRC -->|"rules.json"| INDEX
     SYNC_BOX --> RULES_BUCKET

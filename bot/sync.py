@@ -1,25 +1,45 @@
 """
-Синхронизация данных: Excel -> SQLite FTS5.
+Синхронизация данных: Excel -> rules.json.
 Запуск: python -m bot.sync
+
+RulesEngine (bot/search.py) сам режет записи на фрагменты и
+держит индекс в памяти, ему нужен только плоский список записей.
 """
 
-import sqlite3
+import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import openpyxl
 
-from config.settings import DB_FILE_PATH, RULES_FILE_PATH
+from config.settings import RULES_FILE_PATH, RULES_JSON_PATH
+
+# На этом листе первая колонка — дата решения; без неё строка (шапка и т.п.)
+# в архив не попадает.
+_CHRONOLOGY_SHEET = "Все решения (хронология)"
 
 
-def _row_to_text(sheet_name: str, values: tuple) -> str:
-    cells = [str(v).strip() for v in values if v is not None and str(v).strip()]
+def _row_to_record(sheet_name: str, order: int, values: tuple) -> dict | None:
+    cells = [v for v in values if v is not None and str(v).strip()]
     if not cells:
-        return ""
-    return f"[{sheet_name}]\n" + "\n".join(cells)
+        return None
+
+    date = None
+    if isinstance(cells[0], datetime):
+        date = cells[0].strftime("%d.%m.%Y")
+        cells = cells[1:]
+
+    text = "\n".join(str(v).strip() for v in cells)
+    if not text:
+        return None
+    if sheet_name == _CHRONOLOGY_SHEET and not date:
+        return None
+
+    return {"sheet": sheet_name, "order": order, "date": date, "text": text}
 
 
-def sync(excel_path: str = RULES_FILE_PATH, db_path: str = DB_FILE_PATH) -> int:
+def sync(excel_path: str = RULES_FILE_PATH, json_path: str = RULES_JSON_PATH) -> int:
     xlsx = Path(excel_path)
     if not xlsx.exists():
         print(f"Файл не найден: {excel_path}", file=sys.stderr)
@@ -27,52 +47,29 @@ def sync(excel_path: str = RULES_FILE_PATH, db_path: str = DB_FILE_PATH) -> int:
 
     wb = openpyxl.load_workbook(xlsx, read_only=True, data_only=True)
 
-    db = Path(db_path)
-    db.parent.mkdir(parents=True, exist_ok=True)
-
-    con = sqlite3.connect(db_path)
-    cur = con.cursor()
-    cur.executescript("""
-        DROP TABLE IF EXISTS rules_fts;
-        CREATE VIRTUAL TABLE rules_fts USING fts5(
-            content,
-            tokenize='unicode61'
-        );
-        DROP TABLE IF EXISTS rules_raw;
-        CREATE TABLE rules_raw (
-            id INTEGER PRIMARY KEY,
-            sheet TEXT NOT NULL,
-            row_order INTEGER NOT NULL,
-            content TEXT NOT NULL
-        );
-    """)
-
-    fts_records = []
-    raw_records = []
-
+    records = []
     for sheet_name in wb.sheetnames:
         ws = wb[sheet_name]
-        for row_order, row in enumerate(ws.iter_rows(values_only=True)):
-            text = _row_to_text(sheet_name, row)
-            if text:
-                fts_records.append((text,))
-                raw_records.append((sheet_name, row_order, text))
+        for order, row in enumerate(ws.iter_rows(values_only=True)):
+            record = _row_to_record(sheet_name, order, row)
+            if record:
+                records.append(record)
 
-    cur.executemany("INSERT INTO rules_fts(content) VALUES (?)", fts_records)
-    cur.executemany(
-        "INSERT INTO rules_raw(sheet, row_order, content) VALUES (?, ?, ?)",
-        raw_records,
-    )
-    con.commit()
-    con.close()
     wb.close()
 
-    count = len(fts_records)
-    print(f"Загружено строк: {count} -> {db_path}")
-    return count
+    out = Path(json_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "generated": datetime.now().isoformat(timespec="seconds"),
+        "records": records,
+    }
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    print(f"Загружено записей: {len(records)} -> {json_path}")
+    return len(records)
 
 
 if __name__ == "__main__":
     excel = sys.argv[1] if len(sys.argv) > 1 else RULES_FILE_PATH
-    db = sys.argv[2] if len(sys.argv) > 2 else DB_FILE_PATH
-    sync(excel, db)
+    out = sys.argv[2] if len(sys.argv) > 2 else RULES_JSON_PATH
+    sync(excel, out)

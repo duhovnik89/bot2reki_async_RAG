@@ -1,8 +1,8 @@
 """ВКонтакте Callback API для serverless (Yandex Cloud Functions).
 
 Ключевая идея — разрыв «ответить VK» и «посчитать ответ»: VK ждёт `ok` всего
-несколько секунд, а DeepSeek с полным архивом в промпте отвечает дольше.
-Медленные ветки (вопрос к DeepSeek, отправка документов) уходят в асинхронный
+несколько секунд, а ответ LLM занимает десятки секунд.
+Медленные ветки (вопрос к LLM, отправка документов) уходят в асинхронный
 само-вызов функции. Сам механизм живёт в `bot/async_jobs.py` — он общий с
 Telegram.
 """
@@ -142,7 +142,7 @@ async def handle_vk_event(data: dict) -> dict:
     if not text:
         return _OK
 
-    # --- медленные ветки: документы и вопрос к DeepSeek → в async-воркер ---
+    # --- медленные ветки: документы и вопрос к LLM → в async-воркер ---
     if low in _DOCS:
         job = {"target": "vk", "kind": "doc", "peer_id": peer_id, "doc": low}
     else:
@@ -174,7 +174,7 @@ async def process_vk_job(job: dict) -> None:
         # Задание, поставленное до выкатки истории, ключа conv не несёт.
         conv = job.get("conv") or conversation_key("vk", peer_id, peer_id)
         history = await _history.aload(conv)
-        logger.info("VK-воркер: иду в DeepSeek для %s (история: %d)", peer_id, len(history))
+        logger.info("VK-воркер: иду в LLM для %s (история: %d)", peer_id, len(history))
         answer, ok = await _engine.ask(job["text"], history)
         await _send(peer_id, answer)
         if ok:
