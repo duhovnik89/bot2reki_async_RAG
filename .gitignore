@@ -3,6 +3,7 @@
 
 # Временные файлы Python
 __pycache__/
+tests/__pycache__/
 *.py[cod]
 *.pyo
 
@@ -15,9 +16,14 @@ data/*.xlsx
 data/*.xls
 data/*.csv
 
+# Тестовые файлы
+tests/*.py
+
 # Системные файлы
 .DS_Store
 Thumbs.db
+
+.pytest_cache/
 
 # Временные файлы офисных приложений
 data/.~lock.*
